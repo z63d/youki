@@ -2,6 +2,7 @@ use std::fs::{canonicalize, create_dir_all, OpenOptions};
 use std::mem;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 #[cfg(feature = "v1")]
 use std::{borrow::Cow, collections::HashMap};
 
@@ -24,7 +25,9 @@ use super::symlink::SymlinkError;
 use super::utils::{parse_mount, MountOptionConfig};
 use crate::syscall::syscall::create_syscall;
 use crate::syscall::{linux, Syscall, SyscallError};
-use crate::utils::PathBufExt;
+use crate::utils::{retry, PathBufExt};
+
+const MAX_MOUNT_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
@@ -546,30 +549,22 @@ impl Mount {
             PathBuf::from(source)
         };
 
-        if let Err(err) =
+        let mount_op = || -> std::result::Result<(), SyscallError> {
             self.syscall
                 .mount(Some(&*src), dest, typ, mount_option_config.flags, Some(&*d))
-        {
-            if let SyscallError::Nix(errno) = err {
-                if !matches!(errno, Errno::EINVAL) {
-                    tracing::error!("mount of {:?} failed. {}", m.destination(), errno);
-                    return Err(err.into());
+        };
+        // runc has a retry interval of 100ms. We are following this.
+        // https://github.com/opencontainers/runc/blob/v1.3.0/libcontainer/rootfs_linux.go#L1235
+        let delay = Duration::from_millis(100);
+        let retry_policy = |err: &SyscallError| -> bool {
+            match err {
+                SyscallError::Nix(errno) => {
+                    matches!(errno, Errno::EINVAL) || matches!(errno, Errno::EBUSY)
                 }
+                _ => false,
             }
-
-            self.syscall
-                .mount(
-                    Some(&*src),
-                    dest,
-                    typ,
-                    mount_option_config.flags,
-                    Some(&mount_option_config.data),
-                )
-                .map_err(|err| {
-                    tracing::error!("failed to mount {src:?} to {dest:?}");
-                    err
-                })?;
-        }
+        };
+        retry(mount_op, MAX_MOUNT_ATTEMPTS, delay, retry_policy)?;
 
         if typ == Some("bind")
             && mount_option_config.flags.intersects(
@@ -635,7 +630,7 @@ mod tests {
     use anyhow::{Context, Ok, Result};
 
     use super::*;
-    use crate::syscall::test::{MountArgs, TestHelperSyscall};
+    use crate::syscall::test::{ArgName, MountArgs, TestHelperSyscall};
 
     #[test]
     fn test_mount_into_container() -> Result<()> {
@@ -728,6 +723,78 @@ mod tests {
                 .get_mount_args();
             assert_eq!(want, *got);
             assert_eq!(got.len(), 2);
+        }
+        {
+            let m = Mount::new();
+            let mount = &SpecMountBuilder::default()
+                .destination(PathBuf::from("/tmp/retry"))
+                .typ("tmpfs")
+                .source(PathBuf::from("tmpfs"))
+                .build()?;
+            let mount_option_config = parse_mount(mount)?;
+
+            let syscall = m
+                .syscall
+                .as_any()
+                .downcast_ref::<TestHelperSyscall>()
+                .unwrap();
+            syscall.set_ret_err(ArgName::Mount, || {
+                Err(crate::syscall::SyscallError::Nix(nix::errno::Errno::EINVAL))
+            });
+            syscall.set_ret_err_times(ArgName::Mount, MAX_MOUNT_ATTEMPTS as usize - 1);
+
+            assert!(m
+                .mount_into_container(mount, tmp_dir.path(), &mount_option_config, None)
+                .is_ok());
+            assert_eq!(syscall.get_mount_args().len(), 1);
+        }
+        {
+            let m = Mount::new();
+            let mount = &SpecMountBuilder::default()
+                .destination(PathBuf::from("/tmp/retry"))
+                .typ("tmpfs")
+                .source(PathBuf::from("tmpfs"))
+                .build()?;
+            let mount_option_config = parse_mount(mount)?;
+
+            let syscall = m
+                .syscall
+                .as_any()
+                .downcast_ref::<TestHelperSyscall>()
+                .unwrap();
+            syscall.set_ret_err(ArgName::Mount, || {
+                Err(crate::syscall::SyscallError::Nix(nix::errno::Errno::EBUSY))
+            });
+            syscall.set_ret_err_times(ArgName::Mount, MAX_MOUNT_ATTEMPTS as usize - 1);
+
+            assert!(m
+                .mount_into_container(mount, tmp_dir.path(), &mount_option_config, None)
+                .is_ok());
+            assert_eq!(syscall.get_mount_args().len(), 1);
+        }
+        {
+            let m = Mount::new();
+            let mount = &SpecMountBuilder::default()
+                .destination(PathBuf::from("/tmp/retry"))
+                .typ("tmpfs")
+                .source(PathBuf::from("tmpfs"))
+                .build()?;
+            let mount_option_config = parse_mount(mount)?;
+
+            let syscall = m
+                .syscall
+                .as_any()
+                .downcast_ref::<TestHelperSyscall>()
+                .unwrap();
+            syscall.set_ret_err(ArgName::Mount, || {
+                Err(crate::syscall::SyscallError::Nix(nix::errno::Errno::EBUSY))
+            });
+            syscall.set_ret_err_times(ArgName::Mount, MAX_MOUNT_ATTEMPTS as usize);
+
+            assert!(m
+                .mount_into_container(mount, tmp_dir.path(), &mount_option_config, None)
+                .is_err());
+            assert_eq!(syscall.get_mount_args().len(), 0);
         }
 
         Ok(())
